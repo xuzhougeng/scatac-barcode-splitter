@@ -5,6 +5,7 @@ use fastq::{each_zipped, OwnedRecord, Parser as FastqParser, Record};
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use scatac_barcode_splitter::{reverse_complement, extract_base_header};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -51,19 +52,7 @@ fn open_fastq<P: AsRef<Path>>(p: P) -> Box<dyn Read + Send> {
     }
 }
 
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    seq.iter().rev().map(|b| match b.to_ascii_uppercase() {
-        b'A' => b'T',
-        b'T' => b'A',
-        b'G' => b'C',
-        b'C' => b'G',
-        _    => b'N',
-    }).collect()
-}
 
-fn extract_base_header(head: &[u8]) -> &[u8] {
-    if head.ends_with(b"/1") || head.ends_with(b"/2") { &head[..head.len()-2] } else { head }
-}
 
 /// 把两条 FASTQ 读成 batch，发到下游
 fn reader_thread(
