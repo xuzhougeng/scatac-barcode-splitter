@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use fastq::{each_zipped, OwnedRecord, Parser as FastqParser, Record};
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -41,136 +42,64 @@ struct Args {
     number_suffix: String,
 }
 
-#[derive(Debug, Clone)]
-struct FastqRecord {
-    header: String,
-    sequence: String,
-    plus: String,
-    quality: String,
-}
-
-impl FastqRecord {
-    fn new(header: String, sequence: String, plus: String, quality: String) -> Self {
-        FastqRecord {
-            header,
-            sequence,
-            plus,
-            quality,
-        }
-    }
-    
-    // 直接写入到buffer的方法
-    fn write_to_bytes(&self, buffer: &mut Vec<u8>) {
-        buffer.extend_from_slice(self.header.as_bytes());
-        buffer.push(b'\n');
-        buffer.extend_from_slice(self.sequence.as_bytes());
-        buffer.push(b'\n');
-        buffer.extend_from_slice(self.plus.as_bytes());
-        buffer.push(b'\n');
-        buffer.extend_from_slice(self.quality.as_bytes());
-        buffer.push(b'\n');
+// gzip 或 plain FASTQ 都能自动判断
+fn open_fastq<P: AsRef<Path>>(p: P) -> Box<dyn Read + Send> {
+    let f = File::open(p.as_ref()).unwrap();
+    match p.as_ref().extension().and_then(|s| s.to_str()) {
+        Some("gz") => Box::new(MultiGzDecoder::new(f)),
+        _          => Box::new(f),
     }
 }
 
-fn complement_base(base: char) -> char {
-    match base.to_ascii_uppercase() {
-        'A' => 'T',
-        'T' => 'A',
-        'G' => 'C',
-        'C' => 'G',
-        'N' => 'N',
-        _ => base,
-    }
+fn reverse_complement(seq: &[u8]) -> Vec<u8> {
+    seq.iter().rev().map(|b| match b.to_ascii_uppercase() {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'G' => b'C',
+        b'C' => b'G',
+        _    => b'N',
+    }).collect()
 }
 
-fn reverse_complement(sequence: &str) -> String {
-    sequence
-        .chars()
-        .rev()
-        .map(complement_base)
-        .collect()
+fn extract_base_header(head: &[u8]) -> &[u8] {
+    if head.ends_with(b"/1") || head.ends_with(b"/2") { &head[..head.len()-2] } else { head }
 }
 
-fn extract_base_header(header: &str) -> String {
-    if header.ends_with("/1") || header.ends_with("/2") {
-        header[..header.len() - 2].to_string()
-    } else {
-        header.to_string()
-    }
-}
+/// 把两条 FASTQ 读成 batch，发到下游
+fn reader_thread(
+    r1_path: &Path,
+    r2_path: &Path,
+    batch_len: usize,
+    tx: Sender<(Vec<OwnedRecord>, Vec<OwnedRecord>)>,
+) -> Result<()> {
+    // 构造两个 parser
+    let p1 = FastqParser::new(open_fastq(r1_path));
+    let p2 = FastqParser::new(open_fastq(r2_path));
 
-fn read_fastq_record<R: BufRead>(lines: &mut std::io::Lines<R>) -> Result<Option<FastqRecord>> {
-    // Read header line
-    let header = loop {
-        if let Some(line) = lines.next() {
-            let line = line?;
-            if line.starts_with('@') {
-                break line;
+    let mut r1_batch = Vec::with_capacity(batch_len);
+    let mut r2_batch = Vec::with_capacity(batch_len);
+
+    // fastq‑rs 原生的"成对遍历"——每回调一次就是一对 read
+    each_zipped(p1, p2, |opt1, opt2| {
+        match (opt1, opt2) {
+            (Some(r1), Some(r2)) => {
+                r1_batch.push(r1.to_owned_record()); // OwnedRecord = 结构体版 FASTQ
+                r2_batch.push(r2.to_owned_record());
+                // 满了就发
+                if r1_batch.len() == batch_len {
+                    tx.send((r1_batch.split_off(0), r2_batch.split_off(0))).unwrap();
+                }
+                (true, true) // 两个 parser 都继续
             }
-            // Skip non-header lines (empty lines, etc.)
-        } else {
-            return Ok(None); // End of file
+            // 文件长度不一致时提前终止
+            _ => (false, false),
         }
-    };
-    
-    // Read sequence lines until we hit a '+' line
-    let mut sequence = String::new();
-    loop {
-        if let Some(line) = lines.next() {
-            let line = line?;
-            if line.starts_with('+') {
-                // This is the plus line, stop reading sequence
-                break;
-            } else {
-                sequence.push_str(&line);
-            }
-        } else {
-            return Err(anyhow::anyhow!("Unexpected end of file while reading sequence"));
-        }
-    }
-    
-    // Read quality lines until we have the same length as sequence
-    let mut quality = String::new();
-    while quality.len() < sequence.len() {
-        if let Some(line) = lines.next() {
-            let line = line?;
-            quality.push_str(&line);
-        } else {
-            return Err(anyhow::anyhow!("Unexpected end of file while reading quality"));
-        }
-    }
-    
-    // Trim quality to exact sequence length (in case we read too much)
-    quality.truncate(sequence.len());
-    
-    Ok(Some(FastqRecord::new(header, sequence, "+".to_string(), quality)))
-}
+    })?;
 
-fn read_fastq_batch<R: BufRead>(lines: &mut std::io::Lines<R>, batch_size: usize) -> Result<Vec<FastqRecord>> {
-    let mut batch = Vec::with_capacity(batch_size);
-    
-    for _ in 0..batch_size {
-        if let Some(record) = read_fastq_record(lines)? {
-            batch.push(record);
-        } else {
-            break; // End of file
-        }
+    if !r1_batch.is_empty() {
+        tx.send((r1_batch, r2_batch)).unwrap();
     }
-    
-    Ok(batch)
-}
-
-fn open_reader(path: &PathBuf) -> Result<Box<dyn BufRead + Send>> {
-    let file = File::open(path)?;
-    
-    if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-        let decoder = MultiGzDecoder::new(file);
-        // 增加缓冲区到2MB
-        Ok(Box::new(BufReader::with_capacity(2 << 20, decoder)))
-    } else {
-        // 增加缓冲区到2MB
-        Ok(Box::new(BufReader::with_capacity(2 << 20, file)))
-    }
+    Ok(())
 }
 
 fn create_writer(path: &PathBuf) -> Result<Box<dyn Write + Send>> {
@@ -187,70 +116,57 @@ fn create_writer(path: &PathBuf) -> Result<Box<dyn Write + Send>> {
 }
 
 struct ProcessedRecord {
-    r1_out: FastqRecord,
-    r2_out: FastqRecord,
-    r3_out: FastqRecord,
+    r1_out: OwnedRecord,
+    r2_out: OwnedRecord,
+    r3_out: OwnedRecord,
 }
 
-fn process_record_pair(r1: FastqRecord, r2: FastqRecord) -> Option<ProcessedRecord> {
-    // Check R2 length is 166bp
-    if r2.sequence.len() != 166 {
-        return None;
-    }
-    
-    // Check headers match (after removing /1 and /2)
-    let r1_base = extract_base_header(&r1.header);
-    let r2_base = extract_base_header(&r2.header);
-    
-    if r1_base != r2_base {
-        return None;
-    }
-    
-    // Process R1: remove /1 from header
-    let r1_out = FastqRecord::new(
-        r1_base.clone(),
-        r1.sequence,
-        r1.plus,
-        r1.quality,
-    );
-    
-    // Process R2: positions 151-166 (16bp), reverse complement
-    let r2_seq = &r2.sequence[150..166]; // 0-based indexing, so 150..166 for 151-166
-    let r2_qual = &r2.quality[150..166];
-    let r2_rc_seq = reverse_complement(r2_seq);
-    let r2_rc_qual: String = r2_qual.chars().rev().collect(); // reverse quality scores too
-    
-    let r2_out = FastqRecord::new(
-        r1_base.clone(),
-        r2_rc_seq,
-        r2.plus.clone(),
-        r2_rc_qual,
-    );
-    
-    // Process R3: positions 1-150 (150bp), forward
-    let r3_seq = &r2.sequence[0..150];
-    let r3_qual = &r2.quality[0..150];
-    
-    let r3_out = FastqRecord::new(
-        r1_base,
-        r3_seq.to_string(),
-        r2.plus,
-        r3_qual.to_string(),
-    );
-    
-    Some(ProcessedRecord {
-        r1_out,
-        r2_out,
-        r3_out,
-    })
+fn process_pair(
+    r1: OwnedRecord,
+    r2: OwnedRecord,
+) -> Option<(OwnedRecord, OwnedRecord, OwnedRecord)> {
+    if r2.seq().len() != 166 { return None; }
+
+    let id1 = extract_base_header(r1.head());
+    let id2 = extract_base_header(r2.head());
+    if id1 != id2 { return None; }
+
+    // ---------- R1 ----------
+    let id1_vec = id1.to_vec();
+    let mut out1 = r1;             // 复用内存；只需截 ID
+    out1.head = id1_vec.clone();
+
+    // ---------- R2 ----------
+    let (tail_seq, head_seq) = r2.seq().split_at(150); // 0..150, 150..166
+    let (tail_qual, head_qual) = r2.qual().split_at(150);
+
+    let out2 = OwnedRecord {
+        head : id1_vec.clone(),
+        seq  : reverse_complement(head_seq),
+        qual : head_qual.iter().rev().cloned().collect(),
+        sep  : None,
+    };
+
+    // ---------- R3 ----------
+    let out3 = OwnedRecord {
+        head : id1_vec,
+        seq  : tail_seq.to_vec(),
+        qual : tail_qual.to_vec(),
+        sep  : None,
+    };
+    Some((out1, out2, out3))
 }
 
-fn process_batch(r1_batch: Vec<FastqRecord>, r2_batch: Vec<FastqRecord>) -> Vec<ProcessedRecord> {
+fn process_batch(r1_batch: Vec<OwnedRecord>, r2_batch: Vec<OwnedRecord>) -> Vec<ProcessedRecord> {
     let mut results = Vec::new();
     
     for (r1, r2) in r1_batch.into_iter().zip(r2_batch.into_iter()) {
-        if let Some(processed) = process_record_pair(r1, r2) {
-            results.push(processed);
+        if let Some((r1_out, r2_out, r3_out)) = process_pair(r1, r2) {
+            results.push(ProcessedRecord {
+                r1_out,
+                r2_out,
+                r3_out,
+            });
         }
     }
     
@@ -276,7 +192,7 @@ fn main() -> Result<()> {
     }
     
     // Create channels for batch processing - 增加缓冲区大小
-    let (batch_tx, batch_rx): (Sender<(Vec<FastqRecord>, Vec<FastqRecord>)>, Receiver<(Vec<FastqRecord>, Vec<FastqRecord>)>) = bounded(50);
+    let (batch_tx, batch_rx): (Sender<(Vec<OwnedRecord>, Vec<OwnedRecord>)>, Receiver<(Vec<OwnedRecord>, Vec<OwnedRecord>)>) = bounded(50);
     let (output_tx, output_rx): (Sender<Vec<ProcessedRecord>>, Receiver<Vec<ProcessedRecord>>) = bounded(50);
     
     // Statistics
@@ -289,51 +205,11 @@ fn main() -> Result<()> {
     let r2_input = args.r2_input.clone();
     let batch_size = args.batch_size;
     let verbose = args.verbose;
-    let read_count = Arc::clone(&total_read);
+    let _read_count = Arc::clone(&total_read);
     let reader_handle = thread::spawn(move || -> Result<()> {
-        let r1_reader = open_reader(&r1_input)?;
-        let r2_reader = open_reader(&r2_input)?;
-        
-        let mut r1_lines = r1_reader.lines();
-        let mut r2_lines = r2_reader.lines();
-        
-        loop {
-            let r1_batch = read_fastq_batch(&mut r1_lines, batch_size);
-            let r2_batch = read_fastq_batch(&mut r2_lines, batch_size);
-            
-            match (r1_batch, r2_batch) {
-                (Ok(r1_batch), Ok(r2_batch)) => {
-                    if r1_batch.is_empty() || r2_batch.is_empty() {
-                        if verbose {
-                            println!("Reached end of file. R1 batch: {}, R2 batch: {}", r1_batch.len(), r2_batch.len());
-                        }
-                        break;
-                    }
-                    
-                    let batch_count = r1_batch.len().min(r2_batch.len());
-                    *read_count.lock().unwrap() += batch_count;
-                    
-                    if verbose && *read_count.lock().unwrap() % 1000000 == 0 {
-                        println!("Read {} record pairs...", *read_count.lock().unwrap());
-                    }
-                    
-                    if batch_tx.send((r1_batch, r2_batch)).is_err() {
-                        println!("Channel send failed, stopping reader");
-                        break;
-                    }
-                }
-                (Err(e1), _) => {
-                    println!("Error reading R1 batch: {}", e1);
-                    return Err(e1);
-                }
-                (_, Err(e2)) => {
-                    println!("Error reading R2 batch: {}", e2);
-                    return Err(e2);
-                }
-            }
-        }
+        reader_thread(&r1_input, &r2_input, batch_size, batch_tx)?;
         if verbose {
-            println!("Finished reading {} record pairs", *read_count.lock().unwrap());
+            println!("Finished reading record pairs");
         }
         Ok(())
     });
@@ -368,9 +244,9 @@ fn main() -> Result<()> {
     }
     
     // Create separate channels for each output file
-    let (r1_tx, r1_rx): (Sender<Vec<FastqRecord>>, Receiver<Vec<FastqRecord>>) = bounded(50);
-    let (r2_tx, r2_rx): (Sender<Vec<FastqRecord>>, Receiver<Vec<FastqRecord>>) = bounded(50);
-    let (r3_tx, r3_rx): (Sender<Vec<FastqRecord>>, Receiver<Vec<FastqRecord>>) = bounded(50);
+    let (r1_tx, r1_rx): (Sender<Vec<OwnedRecord>>, Receiver<Vec<OwnedRecord>>) = bounded(50);
+    let (r2_tx, r2_rx): (Sender<Vec<OwnedRecord>>, Receiver<Vec<OwnedRecord>>) = bounded(50);
+    let (r3_tx, r3_rx): (Sender<Vec<OwnedRecord>>, Receiver<Vec<OwnedRecord>>) = bounded(50);
     
     // Distribution thread - 分发处理结果到各个写入线程
     let verbose_dist = args.verbose;
@@ -415,13 +291,10 @@ fn main() -> Result<()> {
         let r1_output = r1_output.clone();
         thread::spawn(move || -> Result<()> {
             let mut writer = create_writer(&r1_output)?;
-            let mut buffer = Vec::with_capacity(1 << 20); // 1MB buffer
             while let Ok(batch) = r1_rx.recv() {
-                buffer.clear();
                 for record in batch {
-                    record.write_to_bytes(&mut buffer);
+                    record.write(&mut writer)?;   // fastq‑rs 一条调用完成
                 }
-                writer.write_all(&buffer)?;
             }
             Ok(())
         })
@@ -431,13 +304,10 @@ fn main() -> Result<()> {
         let r2_output = r2_output.clone();
         thread::spawn(move || -> Result<()> {
             let mut writer = create_writer(&r2_output)?;
-            let mut buffer = Vec::with_capacity(1 << 20); // 1MB buffer
             while let Ok(batch) = r2_rx.recv() {
-                buffer.clear();
                 for record in batch {
-                    record.write_to_bytes(&mut buffer);
+                    record.write(&mut writer)?;   // fastq‑rs 一条调用完成
                 }
-                writer.write_all(&buffer)?;
             }
             Ok(())
         })
@@ -447,13 +317,10 @@ fn main() -> Result<()> {
         let r3_output = r3_output.clone();
         thread::spawn(move || -> Result<()> {
             let mut writer = create_writer(&r3_output)?;
-            let mut buffer = Vec::with_capacity(1 << 20); // 1MB buffer
             while let Ok(batch) = r3_rx.recv() {
-                buffer.clear();
                 for record in batch {
-                    record.write_to_bytes(&mut buffer);
+                    record.write(&mut writer)?;   // fastq‑rs 一条调用完成
                 }
-                writer.write_all(&buffer)?;
             }
             Ok(())
         })
