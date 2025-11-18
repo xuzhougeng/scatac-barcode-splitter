@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+// Type aliases to reduce complexity
+type RecordBatch = (Vec<OwnedRecord>, Vec<OwnedRecord>);
+type BatchSender = Sender<RecordBatch>;
+type BatchReceiver = Receiver<RecordBatch>;
+
 
 
 #[derive(Parser)]
@@ -44,11 +49,11 @@ struct Args {
 }
 
 // gzip 或 plain FASTQ 都能自动判断
-fn open_fastq<P: AsRef<Path>>(p: P) -> Box<dyn Read + Send> {
-    let f = File::open(p.as_ref()).unwrap();
+fn open_fastq<P: AsRef<Path>>(p: P) -> Result<Box<dyn Read + Send>> {
+    let f = File::open(p.as_ref())?;
     match p.as_ref().extension().and_then(|s| s.to_str()) {
-        Some("gz") => Box::new(MultiGzDecoder::new(f)),
-        _          => Box::new(f),
+        Some("gz") => Ok(Box::new(MultiGzDecoder::new(f))),
+        _          => Ok(Box::new(f)),
     }
 }
 
@@ -59,11 +64,11 @@ fn reader_thread(
     r1_path: &Path,
     r2_path: &Path,
     batch_len: usize,
-    tx: Sender<(Vec<OwnedRecord>, Vec<OwnedRecord>)>,
+    tx: BatchSender,
 ) -> Result<()> {
     // 构造两个 parser
-    let p1 = FastqParser::new(open_fastq(r1_path));
-    let p2 = FastqParser::new(open_fastq(r2_path));
+    let p1 = FastqParser::new(open_fastq(r1_path)?);
+    let p2 = FastqParser::new(open_fastq(r2_path)?);
 
     let mut r1_batch = Vec::with_capacity(batch_len);
     let mut r2_batch = Vec::with_capacity(batch_len);
@@ -179,22 +184,20 @@ fn main() -> Result<()> {
     if args.verbose {
         println!("Starting batch processing with batch size: {}", args.batch_size);
     }
-    
+
     // Create channels for batch processing - 增加缓冲区大小
-    let (batch_tx, batch_rx): (Sender<(Vec<OwnedRecord>, Vec<OwnedRecord>)>, Receiver<(Vec<OwnedRecord>, Vec<OwnedRecord>)>) = bounded(50);
+    let (batch_tx, batch_rx): (BatchSender, BatchReceiver) = bounded(50);
     let (output_tx, output_rx): (Sender<Vec<ProcessedRecord>>, Receiver<Vec<ProcessedRecord>>) = bounded(50);
     
     // Statistics
     let processed_count = Arc::new(Mutex::new(0usize));
     let filtered_count = Arc::new(Mutex::new(0usize));
-    let total_read = Arc::new(Mutex::new(0usize));
     
     // Start reader thread
     let r1_input = args.r1_input.clone();
     let r2_input = args.r2_input.clone();
     let batch_size = args.batch_size;
     let verbose = args.verbose;
-    let _read_count = Arc::clone(&total_read);
     let reader_handle = thread::spawn(move || -> Result<()> {
         reader_thread(&r1_input, &r2_input, batch_size, batch_tx)?;
         if verbose {
@@ -221,11 +224,9 @@ fn main() -> Result<()> {
                 
                 *proc_count.lock().unwrap() += processed_in_batch;
                 *filt_count.lock().unwrap() += filtered_in_batch;
-                
-                if !results.is_empty() {
-                    if tx.send(results).is_err() {
-                        break;
-                    }
+
+                if !results.is_empty() && tx.send(results).is_err() {
+                    break;
                 }
             }
         });
