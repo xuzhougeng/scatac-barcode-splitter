@@ -40,7 +40,7 @@ fn test_reverse_complement_with_n() {
 fn test_reverse_complement_unknown_bases() {
     // 测试未知碱基（非 ATGC）会被转换为 N
     let input = b"ATXGC";
-    let expected = b"GCNAT";  // X 被转换为 N
+    let expected = b"GCNAT"; // X 被转换为 N
     let result = reverse_complement(input);
     assert_eq!(result, expected);
 }
@@ -66,7 +66,7 @@ fn test_reverse_complement_long_sequence() {
 #[test]
 fn test_reverse_complement_palindrome() {
     // 测试回文序列
-    let input = b"GAATTC";  // EcoRI 切点
+    let input = b"GAATTC"; // EcoRI 切点
     let expected = b"GAATTC";
     let result = reverse_complement(input);
     assert_eq!(result, expected);
